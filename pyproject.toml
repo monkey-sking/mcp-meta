@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-meta"
+version = "0.1.0"
+description = "Expose many MCP servers through two lazy tools"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "monkey-sking" }]
+keywords = ["mcp", "model-context-protocol", "llm", "tools", "router"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+urls = { Source = "https://github.com/monkey-sking/mcp-meta" }
+dependencies = []
+
+[project.scripts]
+mcp-meta = "mcp_meta.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mcp_meta*"]

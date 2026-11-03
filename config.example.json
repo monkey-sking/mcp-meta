@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "calc": {
+      "url": "http://127.0.0.1:3425/mcp/calc"
+    },
+    "search": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TOKEN}"
+      },
+      "timeout": 30
+    },
+    "memory": {
+      "command": ["npx", "-y", "@modelcontextprotocol/server-memory"],
+      "exclude": ["delete_entities"]
+    }
+  }
+}
