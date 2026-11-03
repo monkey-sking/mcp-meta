@@ -141,6 +141,26 @@ needs `serve`.
 - `mcp_call` returns text content; non-text blocks are serialized as JSON.
 - Resources, prompts, and sampling are not proxied.
 
+## Before / after (this machine)
+
+The project started as a 214-line personal script wrapping a Magpie Library.
+This is the measured difference on the machine it came from, with 14 upstream
+servers behind it:
+
+| | Before | After |
+| --- | --- | --- |
+| Implementation | one-off script at `~/.dsh/bin/mcp-meta.py` | package installed with `uv tool` / `pipx` |
+| Config source | hardcoded `~/.config/magpie/library.json` | own config, Magpie file as fallback |
+| Upstream transports | HTTP only | HTTP + stdio |
+| Registered as | `python3 ~/.dsh/bin/mcp-meta.py` | `mcp-meta serve` |
+| Tool schema per request | 104 tools, 142,746 chars | 2 tools, 892 chars (-99.4%) |
+| SSE handling | first `data:` line only | full multi-line SSE events |
+| HTTP session | none | `Mcp-Session-Id` sent on every request |
+| `tools/list` pagination | ignored | followed to the last page |
+| Protocol negotiation | fixed `2024-11-05` | falls back across three revisions |
+| Tool filtering | none | `include` / `exclude` per server |
+| Tests | none | 15 (unit + HTTP/stdio integration + end-to-end) |
+
 ## Development
 
 ```bash
