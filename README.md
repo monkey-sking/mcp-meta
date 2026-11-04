@@ -12,10 +12,12 @@ two tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `mcp_tools` | List servers, or one server's tools with compact signatures |
+| `mcp_tools` | Overview, compact signatures, cross-server search, or one full schema |
 | `mcp_call` | Call one tool on one server |
 
-Schemas are fetched lazily, only when the model asks for them.
+Schemas are fetched lazily, and only as deep as the model asks for: a server
+overview, then compact one-line signatures, then a single tool's complete JSON
+schema when the arguments need to be exact.
 
 ## Why
 
@@ -67,11 +69,14 @@ Create `~/.config/mcp-meta/servers.json`:
 | Field | Meaning |
 | --- | --- |
 | `url` | HTTP endpoint of an upstream MCP server |
-| `command` | Argv array for a stdio upstream, e.g. `["npx", "-y", "pkg"]` |
+| `command` | Argv array for a stdio upstream, e.g. `["npx", "-y", "pkg"]`; a `command` string plus an `args` array also works |
+| `cwd` | Working directory for a stdio upstream |
 | `headers` | Extra HTTP headers; values expand `${VAR}` from the environment |
 | `env` | Extra environment variables for a stdio upstream |
 | `timeout` | Per-request timeout in seconds (default `60`) |
+| `idle_timeout` | Seconds of inactivity before a stdio upstream is stopped (default: keep it for the life of the process) |
 | `include` / `exclude` | Optional tool allowlist / denylist |
+| `disabled` | `true` skips the entry |
 
 Config discovery order:
 
@@ -82,6 +87,19 @@ Config discovery order:
 
 Magpie's `library.json` works directly, so an existing Magpie Library can be
 used as the upstream list without editing it.
+
+Claude Desktop and Cursor configs work too: the `mcpServers` key and the
+`command` + `args` split are read as-is, so a client config can be used
+directly as `--config`, or converted into mcp-meta's own shape:
+
+```bash
+mcp-meta import ~/Library/Application\ Support/Claude/claude_desktop_config.json
+# wrote 6 servers to ~/.config/mcp-meta/servers.json
+```
+
+`import` copies entries verbatim, so `${VAR}` references are not expanded into
+the file, and it will not overwrite an existing `servers.json` without
+`--force`. Use `--stdout` to inspect the result first.
 
 ## Use with an MCP client
 
@@ -116,6 +134,7 @@ Or without installing:
 
 ```bash
 mcp-meta list                      # servers, transports, tool counts
+mcp-meta import client-config.json # convert a Claude/Cursor/Magpie config
 mcp-meta call calc add '{"a": 2, "b": 3}'
 mcp-meta serve --config ./servers.json
 ```
@@ -125,13 +144,24 @@ needs `serve`.
 
 ## How it behaves
 
-- `mcp_tools` without a `server` prints a cheap overview; with a `server` it
-  prints one line per tool, e.g. `search(query: string, [limit: integer])`,
-  where brackets mark optional parameters.
+- `mcp_tools` without arguments prints a cheap overview, one line per server.
+- `mcp_tools server="x"` prints one line per tool, e.g.
+  `search(query: string, [limit: integer])`, where brackets mark optional
+  parameters.
+- `mcp_tools server="x" tool="y"` returns that tool's complete JSON definition
+  — nested objects, `enum` values, `required` lists — so arguments never have
+  to be guessed from a compact signature.
+- `mcp_tools servers=["a", "b"]` lists several servers in one call.
+- `mcp_tools query="file"` searches server names, tool names and descriptions
+  across every server (case-insensitive, all words must match). `limit` caps
+  the output at 50 matches by default, 200 at most.
+- Queries that span servers fetch them in parallel, up to 8 at a time; a
+  single server's `tools/list` stays serialized.
 - Tool lists are cached for 5 minutes per server. Pass `refresh: true` to
   bypass the cache.
 - Upstream sessions are opened on first use and kept for the life of the
-  process.
+  process. With `idle_timeout` set, an idle stdio upstream is stopped and
+  restarted transparently on the next call.
 - HTTP upstreams are supported both as plain JSON and as SSE responses,
   including `Mcp-Session-Id` handling.
 - Protocol revisions are negotiated downward (`2025-06-18` -> `2025-03-26` ->
@@ -143,6 +173,8 @@ needs `serve`.
 
 - The front end is stdio only (what desktop MCP clients expect).
 - `mcp_call` returns text content; non-text blocks are serialized as JSON.
+- `query` matches server names, tool names and descriptions; it does not search
+  inside parameter schemas.
 - Resources, prompts, and sampling are not proxied.
 
 ## Before / after (this machine)
@@ -163,7 +195,10 @@ servers behind it:
 | `tools/list` pagination | ignored | followed to the last page |
 | Protocol negotiation | fixed `2024-11-05` | falls back across three revisions |
 | Tool filtering | none | `include` / `exclude` per server |
-| Tests | none | 15 (unit + HTTP/stdio integration + end-to-end) |
+| Config formats | one hardcoded shape | Claude/Cursor `mcpServers`, Magpie, bare mappings |
+| Tool detail | signature only | `server` + `tool` returns the full JSON schema |
+| Long-running stdio upstreams | never released | optional `idle_timeout` reaping |
+| Tests | none | 24 (unit + HTTP/stdio integration + end-to-end) |
 
 ## Development
 

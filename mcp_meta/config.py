@@ -4,8 +4,9 @@ The config is a JSON document with a ``servers`` object:
 
     {"servers": {"calc": {"url": "http://127.0.0.1:3425/mcp/calc"}}}
 
-Two compatibility shapes are also accepted: a bare ``{name: url}`` mapping and
-Magpie's ``library.json`` (``{"mcp": [{"name": ..., "url": ...}]}``).
+Compatibility shapes are also accepted: Claude/Cursor's ``mcpServers`` object,
+a bare ``{name: url}`` mapping, and Magpie's ``library.json``
+(``{"mcp": [{"name": ..., "url": ...}]}``).
 """
 
 from __future__ import annotations
@@ -36,9 +37,11 @@ class ServerSpec:
     url: Optional[str] = None
     command: Optional[str] = None
     args: List[str] = field(default_factory=list)
+    cwd: Optional[str] = None
     env: Dict[str, str] = field(default_factory=dict)
     headers: Dict[str, str] = field(default_factory=dict)
     timeout: float = 60.0
+    idle_timeout: Optional[float] = None
     include: Optional[List[str]] = None
     exclude: List[str] = field(default_factory=list)
 
@@ -85,44 +88,100 @@ def _parse_spec(name: str, raw: Any) -> ServerSpec:
     if not url and not command:
         raise ConfigError(f"server '{name}' needs either 'url' or 'command'")
 
-    timeout = raw.get("timeout", 60)
+    try:
+        timeout = float(raw.get("timeout", 60))
+    except (TypeError, ValueError):
+        raise ConfigError(f"server '{name}' has an invalid 'timeout'") from None
+    if timeout <= 0:
+        raise ConfigError(f"server '{name}' timeout must be greater than zero")
+
+    idle_timeout: Optional[float] = None
+    if raw.get("idle_timeout") not in (None, 0, "0"):
+        try:
+            idle_timeout = float(raw["idle_timeout"])
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"server '{name}' has an invalid 'idle_timeout'"
+            ) from None
+        if idle_timeout <= 0:
+            raise ConfigError(
+                f"server '{name}' idle_timeout must be greater than zero"
+            )
+
+    cwd = raw.get("cwd")
     include = raw.get("include")
     return ServerSpec(
         name=str(raw.get("name") or name),
         url=_expand(str(url)) if url else None,
         command=str(command) if command else None,
         args=args,
+        cwd=os.path.expanduser(_expand(str(cwd))) if cwd else None,
         env=_str_map(raw.get("env")),
         headers=_str_map(raw.get("headers")),
-        timeout=float(timeout),
+        timeout=timeout,
+        idle_timeout=idle_timeout,
         include=[str(t) for t in include] if isinstance(include, list) else None,
         exclude=[str(t) for t in _as_list(raw.get("exclude"))],
     )
 
 
-def parse_config(doc: Any) -> Dict[str, ServerSpec]:
+def extract_entries(doc: Any) -> Any:
+    """Pull the server entries out of any supported config shape."""
     if not isinstance(doc, dict):
         raise ConfigError("config root must be a JSON object")
+    for key in ("servers", "mcpServers", "mcp"):
+        if key in doc:
+            return doc[key]
+    return doc
 
-    if "servers" in doc:
-        entries = doc["servers"]
-    elif isinstance(doc.get("mcp"), list):
-        entries = doc["mcp"]
-    elif isinstance(doc.get("mcp"), dict):
-        entries = doc["mcp"]
+
+def normalize_config(doc: Any) -> Dict[str, Any]:
+    """Rewrite any supported shape as ``{"servers": {name: spec}}``.
+
+    Values are copied verbatim, so ``${VAR}`` references survive the import.
+    """
+    entries = extract_entries(doc)
+    servers: Dict[str, Any] = {}
+    if isinstance(entries, list):
+        for item in entries:
+            if not isinstance(item, dict) or not item.get("name"):
+                raise ConfigError("every server entry needs a 'name'")
+            if item.get("disabled"):
+                continue
+            servers[str(item["name"])] = {
+                key: value for key, value in item.items() if key != "name"
+            }
+    elif isinstance(entries, dict):
+        for name, item in entries.items():
+            if name.startswith("$"):
+                continue
+            if isinstance(item, dict) and item.get("disabled"):
+                continue
+            servers[str(name)] = item
     else:
-        entries = doc
+        raise ConfigError("'servers' must be an object or a list")
+    if not servers:
+        raise ConfigError("no usable MCP servers found in config")
+    return {"servers": servers}
+
+
+def parse_config(doc: Any) -> Dict[str, ServerSpec]:
+    entries = extract_entries(doc)
 
     specs: Dict[str, ServerSpec] = {}
     if isinstance(entries, list):
         for item in entries:
             if not isinstance(item, dict) or not item.get("name"):
                 raise ConfigError("every server entry needs a 'name'")
+            if item.get("disabled"):
+                continue
             spec = _parse_spec(str(item["name"]), item)
             specs[spec.name] = spec
     elif isinstance(entries, dict):
         for name, item in entries.items():
             if name.startswith("$"):
+                continue
+            if isinstance(item, dict) and item.get("disabled"):
                 continue
             spec = _parse_spec(str(name), item)
             specs[spec.name] = spec

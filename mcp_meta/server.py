@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
@@ -13,6 +16,9 @@ from .rpc import Session, UpstreamError
 
 PROTOCOL_VERSION = "2025-06-18"
 TOOLS_CACHE_TTL = 300.0
+MAX_PARALLEL_SERVERS = 8
+DEFAULT_SEARCH_LIMIT = 50
+MAX_SEARCH_LIMIT = 200
 
 
 def _type_label(schema: Dict[str, Any]) -> str:
@@ -54,56 +60,274 @@ class MetaServer:
         self.specs = specs
         self._sessions: Dict[str, Session] = {}
         self._tools: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._state_lock = threading.RLock()
+        self._tools_lock = threading.RLock()
+        self._tool_locks = {name: threading.Lock() for name in specs}
+        self._active: Dict[str, int] = {name: 0 for name in specs}
+        self._last_used: Dict[str, float] = {}
+        self._closed = False
+        self._reaper_stop = threading.Event()
+        self._reaper: Optional[threading.Thread] = None
+
+        idle_timeouts = [
+            spec.idle_timeout
+            for spec in specs.values()
+            if spec.idle_timeout is not None
+        ]
+        if idle_timeouts:
+            interval = max(0.05, min(min(idle_timeouts) / 2.0, 30.0))
+            self._reaper = threading.Thread(
+                target=self._reaper_loop,
+                args=(interval,),
+                name="mcp-meta-idle-reaper",
+                daemon=True,
+            )
+            self._reaper.start()
 
     # -- upstream access -------------------------------------------------
-    def _session(self, name: str) -> Session:
-        session = self._sessions.get(name)
-        if session is None:
-            session = Session(self.specs[name])
-            self._sessions[name] = session
-        return session
+    @contextmanager
+    def _session_use(self, name: str):
+        with self._state_lock:
+            if self._closed:
+                raise UpstreamError("mcp-meta is shutting down")
+            session = self._sessions.get(name)
+            if session is None:
+                session = Session(self.specs[name])
+                self._sessions[name] = session
+            self._active[name] = self._active.get(name, 0) + 1
+            self._last_used[name] = time.monotonic()
+        try:
+            yield session
+        finally:
+            with self._state_lock:
+                self._active[name] = max(0, self._active.get(name, 1) - 1)
+                self._last_used[name] = time.monotonic()
 
     def tools_for(self, name: str, refresh: bool = False) -> List[Dict[str, Any]]:
-        cached = self._tools.get(name)
-        if cached and not refresh and time.time() - cached[0] < TOOLS_CACHE_TTL:
-            return cached[1]
-        spec = self.specs[name]
-        tools = [
-            tool
-            for tool in self._session(name).list_tools()
-            if spec.allow_tool(str(tool.get("name")))
-        ]
-        self._tools[name] = (time.time(), tools)
-        return tools
+        with self._tool_locks[name]:
+            with self._tools_lock:
+                cached = self._tools.get(name)
+                if (
+                    cached
+                    and not refresh
+                    and time.time() - cached[0] < TOOLS_CACHE_TTL
+                ):
+                    return cached[1]
+            spec = self.specs[name]
+            with self._session_use(name) as session:
+                tools = [
+                    tool
+                    for tool in session.list_tools()
+                    if spec.allow_tool(str(tool.get("name")))
+                ]
+            with self._tools_lock:
+                self._tools[name] = (time.time(), tools)
+            return tools
 
-    # -- tool implementations --------------------------------------------
-    def tool_mcp_tools(self, args: Dict[str, Any]) -> Tuple[str, bool]:
-        name = args.get("server")
-        refresh = bool(args.get("refresh"))
-        if not name:
-            return self._server_overview(), False
-        name = str(name)
-        if name not in self.specs:
-            return self._unknown_server(name), True
-        try:
-            tools = self.tools_for(name, refresh=refresh)
-        except UpstreamError as exc:
-            return str(exc), True
-        lines = [f"{name}: {len(tools)} tools"]
-        server_info = self._sessions[name].server_info
-        if server_info.get("version"):
-            lines[0] += f" (v{server_info['version']})"
-        lines.append("")
+    def _prefetch(
+        self, names: List[str], refresh: bool = False
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
+        tools_by_name: Dict[str, List[Dict[str, Any]]] = {}
+        errors: Dict[str, str] = {}
+        if not names:
+            return tools_by_name, errors
+        if len(names) == 1:
+            name = names[0]
+            try:
+                tools_by_name[name] = self.tools_for(name, refresh=refresh)
+            except UpstreamError as exc:
+                errors[name] = str(exc)
+            return tools_by_name, errors
+
+        workers = min(MAX_PARALLEL_SERVERS, len(names))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="mcp-meta-prefetch"
+        ) as executor:
+            futures = {
+                executor.submit(self.tools_for, name, refresh): name
+                for name in names
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    tools_by_name[name] = future.result()
+                except UpstreamError as exc:
+                    errors[name] = str(exc)
+        return tools_by_name, errors
+
+    def _server_version(self, name: str) -> str:
+        with self._state_lock:
+            session = self._sessions.get(name)
+            if session is None:
+                return ""
+            return str(session.server_info.get("version") or "")
+
+    def _format_tools(
+        self, name: str, tools: List[Dict[str, Any]], heading: Optional[str] = None
+    ) -> List[str]:
+        lines = [heading or f"{name}: {len(tools)} tools"]
+        version = self._server_version(name)
+        if version and heading is None:
+            lines[0] += f" (v{version})"
         for tool in tools:
             lines.append(f"- {format_signature(tool)}")
             summary = first_sentence(tool.get("description"))
             if summary:
                 lines.append(f"    {summary}")
-        lines.append("")
-        lines.append(
-            f'Call: mcp_call server="{name}" tool="<name>" arguments={{...}}'
+        return lines
+
+    def _known_names(self, names: List[str]) -> Optional[str]:
+        unknown = [name for name in names if name not in self.specs]
+        if not unknown:
+            return None
+        return (
+            f"Unknown server(s): {', '.join(unknown)}. "
+            f"Available: {', '.join(sorted(self.specs))}"
         )
-        return "\n".join(lines), False
+
+    # -- tool implementations --------------------------------------------
+    def tool_mcp_tools(self, args: Dict[str, Any]) -> Tuple[str, bool]:
+        name = args.get("server")
+        tool_name = args.get("tool")
+        query = args.get("query")
+        servers_arg = args.get("servers")
+        refresh = bool(args.get("refresh"))
+
+        if tool_name is not None:
+            if not name:
+                return "'tool' requires a 'server'", True
+            name = str(name)
+            if name not in self.specs:
+                return self._unknown_server(name), True
+            try:
+                tools = self.tools_for(name, refresh=refresh)
+            except UpstreamError as exc:
+                return str(exc), True
+            wanted = str(tool_name)
+            for tool in tools:
+                if tool.get("name") == wanted:
+                    return json.dumps(tool, ensure_ascii=False, indent=2), False
+            available = ", ".join(str(tool.get("name")) for tool in tools)
+            return (
+                f"Unknown tool '{wanted}' on server '{name}'. "
+                f"Available: {available}"
+            ), True
+
+        if name and servers_arg is not None:
+            return "pass either 'server' or 'servers', not both", True
+
+        names: Optional[List[str]] = None
+        if name:
+            names = [str(name)]
+        elif servers_arg is not None:
+            if not isinstance(servers_arg, list) or not servers_arg:
+                return "'servers' must be a non-empty array of server names", True
+            names = []
+            for item in servers_arg:
+                if not isinstance(item, str) or not item:
+                    return "'servers' must contain non-empty strings", True
+                if item not in names:
+                    names.append(item)
+
+        if names is not None:
+            unknown = self._known_names(names)
+            if unknown:
+                return unknown, True
+
+        if query is not None:
+            if not isinstance(query, str) or not query.strip():
+                return "'query' must be a non-empty string", True
+            limit = args.get("limit", DEFAULT_SEARCH_LIMIT)
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or limit > MAX_SEARCH_LIMIT
+            ):
+                return (
+                    f"'limit' must be an integer from 1 to {MAX_SEARCH_LIMIT}"
+                ), True
+            return self._search_tools(
+                names or sorted(self.specs), query, refresh=refresh, limit=limit
+            )
+
+        if names is not None:
+            return self._list_servers(names, refresh=refresh)
+        return self._server_overview(refresh=refresh), False
+
+    def _list_servers(
+        self, names: List[str], refresh: bool = False
+    ) -> Tuple[str, bool]:
+        tools_by_name, errors = self._prefetch(names, refresh=refresh)
+        if len(names) == 1:
+            name = names[0]
+            if name in errors:
+                return errors[name], True
+            lines = self._format_tools(name, tools_by_name[name])
+            lines.append("")
+            lines.append(
+                f'Call: mcp_call server="{name}" tool="<name>" arguments={{...}}'
+            )
+            return "\n".join(lines), False
+
+        lines = [f"{len(names)} selected servers", ""]
+        for name in names:
+            if name in errors:
+                lines.append(
+                    f"- {name}: unavailable: {first_sentence(errors[name], 100)}"
+                )
+                continue
+            lines.extend(self._format_tools(name, tools_by_name.get(name, [])))
+            lines.append("")
+        lines.append('Inspect a tool: mcp_tools server="<name>" tool="<tool>"')
+        return "\n".join(lines).rstrip(), False
+
+    def _search_tools(
+        self, names: List[str], query: str, refresh: bool, limit: int
+    ) -> Tuple[str, bool]:
+        tools_by_name, errors = self._prefetch(names, refresh=refresh)
+        terms = query.casefold().split()
+        matches: Dict[str, List[Dict[str, Any]]] = {}
+        total = 0
+        shown = 0
+        for name in names:
+            for tool in tools_by_name.get(name, []):
+                haystack = " ".join(
+                    (
+                        name,
+                        str(tool.get("name") or ""),
+                        str(tool.get("description") or ""),
+                    )
+                ).casefold()
+                if all(term in haystack for term in terms):
+                    total += 1
+                    if shown < limit:
+                        matches.setdefault(name, []).append(tool)
+                        shown += 1
+
+        if not total:
+            lines = [f'No tools matched "{query}".']
+            if errors:
+                lines.append("")
+                lines.append("Unavailable: " + ", ".join(sorted(errors)))
+            return "\n".join(lines), False
+
+        lines = [f'{total} matches for "{query}" across {len(names)} servers', ""]
+        for name in names:
+            found = matches.get(name)
+            if found:
+                lines.extend(
+                    self._format_tools(
+                        name, found, heading=f"{name}: {len(found)} matches"
+                    )
+                )
+                lines.append("")
+        if shown < total:
+            lines.append(f"Showing {shown} of {total} matches; refine the query.")
+        if errors:
+            lines.append("Unavailable: " + ", ".join(sorted(errors)))
+        lines.append('Inspect one: mcp_tools server="<name>" tool="<tool>"')
+        return "\n".join(lines).rstrip(), False
 
     def tool_mcp_call(self, args: Dict[str, Any]) -> Tuple[str, bool]:
         name = args.get("server")
@@ -119,7 +343,8 @@ class MetaServer:
         if not isinstance(arguments, dict):
             return "'arguments' must be a JSON object", True
         try:
-            result = self._session(name).call_tool(tool, arguments)
+            with self._session_use(name) as session:
+                result = session.call_tool(tool, arguments)
         except UpstreamError as exc:
             return str(exc), True
         parts: List[str] = []
@@ -136,19 +361,45 @@ class MetaServer:
         text = "\n".join(parts) or json.dumps(result, ensure_ascii=False)
         return text, bool(result.get("isError"))
 
-    def _server_overview(self) -> str:
+    def _server_overview(self, refresh: bool = False) -> str:
         lines = [f"{len(self.specs)} upstream servers", ""]
+        names = sorted(self.specs)
+        tools_by_name, errors = self._prefetch(names, refresh=refresh)
         for name in sorted(self.specs):
             spec = self.specs[name]
             target = spec.url or f"{spec.command} {' '.join(spec.args)}".strip()
-            try:
-                count: Any = f"{len(self.tools_for(name))} tools"
-            except UpstreamError as exc:
-                count = f"unavailable: {first_sentence(exc, 80)}"
+            if name in errors:
+                count: Any = f"unavailable: {first_sentence(errors[name], 80)}"
+            else:
+                count = f"{len(tools_by_name.get(name, []))} tools"
             lines.append(f"- {name} [{spec.transport}] {count} <- {target}")
         lines.append("")
         lines.append('Inspect one: mcp_tools server="<name>"')
         return "\n".join(lines)
+
+    def _reaper_loop(self, interval: float) -> None:
+        while not self._reaper_stop.wait(interval):
+            self._reap_idle()
+
+    def _reap_idle(self) -> None:
+        expired: List[Session] = []
+        now = time.monotonic()
+        with self._state_lock:
+            if self._closed:
+                return
+            for name, spec in self.specs.items():
+                timeout = spec.idle_timeout
+                if timeout is None or self._active.get(name, 0):
+                    continue
+                last_used = self._last_used.get(name)
+                if last_used is None or now - last_used < timeout:
+                    continue
+                session = self._sessions.pop(name, None)
+                self._last_used.pop(name, None)
+                if session is not None:
+                    expired.append(session)
+        for session in expired:
+            session.close()
 
     def _unknown_server(self, name: str) -> str:
         return f"Unknown server '{name}'. Available: {', '.join(sorted(self.specs))}"
@@ -160,15 +411,48 @@ class MetaServer:
             {
                 "name": "mcp_tools",
                 "description": (
-                    "List MCP servers, or the tools one server offers with "
-                    "compact signatures. Available servers: " + names
+                    "Discover MCP tools: list servers, list or search compact "
+                    "signatures across servers, or show one tool's full "
+                    "definition. Available servers: " + names
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "server": {
                             "type": "string",
-                            "description": "Server name. Omit for an overview.",
+                            "description": (
+                                "One server name. Omit for an overview or "
+                                "multi-server search."
+                            ),
+                        },
+                        "servers": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "Limit a list or search to these server names."
+                            ),
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": (
+                                "With server, return this tool's full definition "
+                                "and input schema."
+                            ),
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Case-insensitive terms matched against server "
+                                "name, tool name, and tool description."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SEARCH_LIMIT,
+                            "default": DEFAULT_SEARCH_LIMIT,
+                            "description": "Maximum number of search matches.",
                         },
                         "refresh": {
                             "type": "boolean",
@@ -251,7 +535,16 @@ class MetaServer:
         }
 
     def close(self) -> None:
-        for session in self._sessions.values():
+        self._reaper_stop.set()
+        if self._reaper is not None and self._reaper is not threading.current_thread():
+            self._reaper.join(timeout=2)
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
             session.close()
 
 

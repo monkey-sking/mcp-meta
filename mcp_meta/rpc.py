@@ -142,6 +142,7 @@ class HttpTransport:
 
 class StdioTransport:
     def __init__(self, spec: ServerSpec) -> None:
+        self.spec = spec
         self.name = spec.name
         self.timeout = spec.timeout
         env = dict(os.environ)
@@ -153,6 +154,7 @@ class StdioTransport:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 env=env,
+                cwd=self.spec.cwd,
                 text=True,
                 bufsize=1,
             )

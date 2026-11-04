@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -25,7 +26,32 @@ HTTP_TOOLS = [
             },
             "required": ["query"],
         },
-    }
+    },
+    {
+        "name": "create_ticket",
+        "description": "Create a nested ticket. Priority and labels are strict.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "normal", "high"],
+                        },
+                        "labels": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["priority"],
+                },
+            },
+            "required": ["subject", "metadata"],
+        },
+    },
 ]
 
 
@@ -89,7 +115,11 @@ class FakeHttpMcp(BaseHTTPRequestHandler):
             self._send_sse(
                 [
                     {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},
-                    {"jsonrpc": "2.0", "id": request_id, "result": {"tools": HTTP_TOOLS}},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"tools": HTTP_TOOLS},
+                    },
                 ]
             )
         elif method == "tools/call":
@@ -134,7 +164,7 @@ class HttpSessionTests(unittest.TestCase):
         session = Session(self.specs["web"])
         try:
             tools = session.list_tools()
-            self.assertEqual([t["name"] for t in tools], ["search"])
+            self.assertEqual([t["name"] for t in tools], ["search", "create_ticket"])
             self.assertEqual(self.server.registry["session"], None)
             self.assertEqual(self.server.registry["later_session"], "sess-123")
             result = session.call_tool("search", {"query": "mcp"})
@@ -148,17 +178,84 @@ class HttpSessionTests(unittest.TestCase):
         try:
             overview, is_error = meta.tool_mcp_tools({})
             self.assertFalse(is_error)
-            self.assertIn("web [http] 1 tools", overview)
+            self.assertIn("web [http] 2 tools", overview)
 
             listing, is_error = meta.tool_mcp_tools({"server": "web"})
             self.assertFalse(is_error)
             self.assertIn("search(query: string, [limit: integer])", listing)
+            self.assertIn("create_ticket(subject: string, metadata: object)", listing)
 
             text, is_error = meta.tool_mcp_call(
                 {"server": "web", "tool": "search", "arguments": {"query": "x"}}
             )
             self.assertFalse(is_error)
             self.assertEqual(text, "results for x")
+        finally:
+            meta.close()
+
+    def test_full_tool_definition(self):
+        meta = MetaServer(self.specs)
+        try:
+            text, is_error = meta.tool_mcp_tools(
+                {"server": "web", "tool": "create_ticket"}
+            )
+            self.assertFalse(is_error)
+            definition = json.loads(text)
+            metadata = definition["inputSchema"]["properties"]["metadata"]
+            self.assertEqual(
+                metadata["properties"]["priority"]["enum"],
+                ["low", "normal", "high"],
+            )
+        finally:
+            meta.close()
+
+    def test_cross_server_search_and_selected_listing(self):
+        specs = parse_config(
+            {
+                "servers": {
+                    "web": {
+                        "url": self.specs["web"].url,
+                        "include": ["search"],
+                    },
+                    "tickets": {
+                        "url": self.specs["web"].url,
+                        "include": ["create_ticket"],
+                    },
+                }
+            }
+        )
+        meta = MetaServer(specs)
+        try:
+            found, is_error = meta.tool_mcp_tools({"query": "priority"})
+            self.assertFalse(is_error)
+            self.assertIn("1 matches", found)
+            self.assertIn("tickets:", found)
+            self.assertIn("create_ticket", found)
+            self.assertNotIn("search(", found)
+
+            selected, is_error = meta.tool_mcp_tools(
+                {"servers": ["web", "tickets"]}
+            )
+            self.assertFalse(is_error)
+            self.assertIn("2 selected servers", selected)
+            self.assertIn("web: 1 tools", selected)
+            self.assertIn("tickets: 1 tools", selected)
+        finally:
+            meta.close()
+
+    def test_search_limit_and_tool_schema_options(self):
+        meta = MetaServer(self.specs)
+        try:
+            # "e" matches both tools; the limit must truncate one of them.
+            text, is_error = meta.tool_mcp_tools({"query": "e", "limit": 1})
+            self.assertFalse(is_error)
+            self.assertIn("Showing 1 of 2 matches", text)
+
+            properties = meta.tools_spec()[0]["inputSchema"]["properties"]
+            self.assertIn("tool", properties)
+            self.assertIn("query", properties)
+            self.assertIn("servers", properties)
+            self.assertEqual(properties["limit"]["maximum"], 200)
         finally:
             meta.close()
 
@@ -201,6 +298,67 @@ class StdioSessionTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_idle_stdio_session_is_reaped_and_restarted(self):
+        fixture = os.path.join(ROOT, "tests", "fixtures", "fake_stdio_server.py")
+        specs = parse_config(
+            {
+                "servers": {
+                    "fake": {
+                        "command": [sys.executable, fixture],
+                        "idle_timeout": 0.1,
+                    }
+                }
+            }
+        )
+        meta = MetaServer(specs)
+        try:
+            meta.tools_for("fake")
+            with meta._state_lock:
+                first = meta._sessions["fake"]
+
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with meta._state_lock:
+                    if "fake" not in meta._sessions:
+                        break
+                time.sleep(0.02)
+            else:
+                self.fail("idle session was not reaped")
+
+            first.transport.process.wait(timeout=2)
+            self.assertIsNotNone(first.transport.process.poll())
+
+            tools = meta.tools_for("fake", refresh=True)
+            self.assertEqual([tool["name"] for tool in tools], ["echo", "add"])
+            with meta._state_lock:
+                self.assertIsNot(meta._sessions["fake"], first)
+        finally:
+            meta.close()
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def test_overview_prefetches_servers_in_parallel(self):
+        specs = parse_config(
+            {
+                "servers": {
+                    f"server-{index}": f"http://127.0.0.1:9/mcp"
+                    for index in range(4)
+                }
+            }
+        )
+        meta = MetaServer(specs)
+        barrier = threading.Barrier(len(specs))
+
+        def fake_tools_for(name, refresh=False):
+            barrier.wait(timeout=2)
+            return []
+
+        meta.tools_for = fake_tools_for
+        try:
+            overview = meta._server_overview()
+            self.assertIn("4 upstream servers", overview)
+        finally:
+            meta.close()
 
 class ServeEndToEndTests(unittest.TestCase):
     def test_stdio_front_end(self):

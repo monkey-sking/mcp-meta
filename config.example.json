@@ -13,6 +13,12 @@
     "memory": {
       "command": ["npx", "-y", "@modelcontextprotocol/server-memory"],
       "exclude": ["delete_entities"]
+    },
+    "localserver": {
+      "command": ["node", "server.js"],
+      "cwd": "~/dev/localserver",
+      "idle_timeout": 900,
+      "disabled": false
     }
   }
 }
