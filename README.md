@@ -1,10 +1,12 @@
 # mcp-meta
 
 <!-- badges:start -->
-[![Stars](https://img.shields.io/github/stars/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/stargazers) [![Forks](https://img.shields.io/github/forks/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/network/members) [![Last commit](https://img.shields.io/github/last-commit/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/commits/main) [![License](https://img.shields.io/github/license/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/blob/main/LICENSE) [![Python](https://img.shields.io/github/languages/top/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/search?l=Python) [![Tests](https://github.com/monkey-sking/mcp-meta/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/monkey-sking/mcp-meta/actions/workflows/tests.yml)
+[![Stars](https://img.shields.io/github/stars/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/stargazers) [![Forks](https://img.shields.io/github/forks/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/network/members) [![Last commit](https://img.shields.io/github/last-commit/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/commits/main) [![License](https://img.shields.io/github/license/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/blob/main/LICENSE) [![Python](https://img.shields.io/github/languages/top/monkey-sking/mcp-meta?style=flat-square)](https://github.com/monkey-sking/mcp-meta/search?l=Python) [![Tests](https://github.com/monkey-sking/mcp-meta/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/monkey-sking/mcp-meta/actions/workflows/tests.yml) [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 <!-- badges:end -->
 
 Expose dozens of MCP tools through **two**.
+
+Part of the meta-tool family: [skill-meta](https://github.com/monkey-sking/skill-meta) applies the same lazy-facade idea to **Agent Skills** (3 tools for N skill catalogs across DSH/Claude/Codex/Magpie).
 
 `mcp-meta` sits between your MCP client and any number of upstream MCP servers.
 Instead of injecting every upstream tool schema into every request, it exposes
