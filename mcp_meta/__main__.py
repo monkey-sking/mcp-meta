@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import __version__
 from .config import ConfigError, load_config, normalize_config, parse_config
@@ -141,7 +141,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1 if is_error else 0
 
     sys.stderr.write(f"mcp-meta: serving {len(specs)} servers from {source}\n")
-    return serve(specs)
+
+    def reload() -> Tuple[Dict[str, ServerSpec], str]:
+        # The file Magpie rewrites on connector changes; re-read on demand so a
+        # long-lived process does not keep serving a stale server list.
+        return load_config(config_path)
+
+    return serve(specs, reload=reload)
 
 
 if __name__ == "__main__":

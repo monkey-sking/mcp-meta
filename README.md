@@ -161,6 +161,11 @@ needs `serve`.
   single server's `tools/list` stays serialized.
 - Tool lists are cached for 5 minutes per server. Pass `refresh: true` to
   bypass the cache.
+- The server list itself is read once, at startup: Magpie rewrites
+  `library.json` when connectors change, so a name can vanish from under a
+  running process. An unknown server therefore answers with the current
+  names, a near-miss suggestion, and the way back — `mcp_tools` with no
+  arguments re-lists and restarts from the file as it is now.
 - Upstream sessions are opened on first use and kept for the life of the
   process. With `idle_timeout` set, an idle stdio upstream is stopped and
   restarted transparently on the next call.

@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from . import __version__
 from .config import ServerSpec
@@ -56,8 +56,17 @@ def first_sentence(text: Any, limit: int = 140) -> str:
 
 
 class MetaServer:
-    def __init__(self, specs: Dict[str, ServerSpec]) -> None:
+    def __init__(
+        self,
+        specs: Dict[str, ServerSpec],
+        reload: Optional[Callable[[], Tuple[Dict[str, ServerSpec], str]]] = None,
+    ) -> None:
         self.specs = specs
+        # Optional re-read of the config file. The server list is otherwise fixed
+        # at startup, and Magpie rewrites library.json when connectors change, so
+        # without this a name can leave the file while the process keeps the old
+        # list (2026-11-13: three retries against a server that had just gone).
+        self._reload = reload
         self._sessions: Dict[str, Session] = {}
         self._tools: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._state_lock = threading.RLock()
@@ -176,14 +185,55 @@ class MetaServer:
                 lines.append(f"    {summary}")
         return lines
 
+    @staticmethod
+    def _with_note(text: str, note: Optional[str]) -> str:
+        """Put a config re-read note in front of the answer, when there is one."""
+        if not note:
+            return text
+        return f"{note}.\n\n{text}"
+
+    def _refresh_specs(self) -> Optional[str]:
+        """Re-read the config file and adopt it. Returns a note, or None."""
+        if self._reload is None:
+            return None
+        try:
+            specs, source = self._reload()
+        except Exception as exc:  # a broken file must not break the session
+            return f"could not re-read the config: {exc}"
+        with self._state_lock:
+            if self._closed:
+                return None
+            added = [name for name in specs if name not in self.specs]
+            removed = [name for name in self.specs if name not in specs]
+            gone = [self._sessions.pop(name) for name in removed if name in self._sessions]
+            for name in removed:
+                self._tool_locks.pop(name, None)
+                self._active.pop(name, None)
+                self._last_used.pop(name, None)
+            self.specs = specs
+            self._tool_locks.update(
+                {name: threading.Lock() for name in added}
+            )
+            self._active.update({name: 0 for name in added})
+            with self._tools_lock:
+                for name in removed:
+                    self._tools.pop(name, None)
+        for session in gone:
+            session.close()
+        if not added and not removed:
+            return f"re-read {source}; the server list is unchanged ({len(specs)} servers)"
+        bits = []
+        if added:
+            bits.append(f"added: {', '.join(sorted(added))}")
+        if removed:
+            bits.append(f"removed: {', '.join(sorted(removed))}")
+        return f"re-read {source} ({len(specs)} servers; {'; '.join(bits)})"
+
     def _known_names(self, names: List[str]) -> Optional[str]:
         unknown = [name for name in names if name not in self.specs]
         if not unknown:
             return None
-        return (
-            f"Unknown server(s): {', '.join(unknown)}. "
-            f"Available: {', '.join(sorted(self.specs))}"
-        )
+        return self._unknown_server(unknown)
 
     # -- tool implementations --------------------------------------------
     def tool_mcp_tools(self, args: Dict[str, Any]) -> Tuple[str, bool]:
@@ -193,12 +243,15 @@ class MetaServer:
         servers_arg = args.get("servers")
         refresh = bool(args.get("refresh"))
 
+        note: Optional[str] = None
         if tool_name is not None:
             if not name:
                 return "'tool' requires a 'server'", True
             name = str(name)
             if name not in self.specs:
-                return self._unknown_server(name), True
+                note = self._refresh_specs()
+                if name not in self.specs:
+                    return self._with_note(self._unknown_server(name), note), True
             try:
                 tools = self.tools_for(name, refresh=refresh)
             except UpstreamError as exc:
@@ -206,7 +259,9 @@ class MetaServer:
             wanted = str(tool_name)
             for tool in tools:
                 if tool.get("name") == wanted:
-                    return json.dumps(tool, ensure_ascii=False, indent=2), False
+                    return self._with_note(
+                        json.dumps(tool, ensure_ascii=False, indent=2), note
+                    ), False
             available = ", ".join(str(tool.get("name")) for tool in tools)
             return (
                 f"Unknown tool '{wanted}' on server '{name}'. "
@@ -232,7 +287,10 @@ class MetaServer:
         if names is not None:
             unknown = self._known_names(names)
             if unknown:
-                return unknown, True
+                note = self._refresh_specs()
+                unknown = self._known_names(names)
+                if unknown:
+                    return self._with_note(unknown, note), True
 
         if query is not None:
             if not isinstance(query, str) or not query.strip():
@@ -252,8 +310,12 @@ class MetaServer:
             )
 
         if names is not None:
-            return self._list_servers(names, refresh=refresh)
-        return self._server_overview(refresh=refresh), False
+            return self._with_note(
+                self._list_servers(names, refresh=refresh)[0], note
+            ), False
+        # No arguments is also the documented way to pick up a rewritten config.
+        note = self._refresh_specs()
+        return self._with_note(self._server_overview(refresh=refresh), note), False
 
     def _list_servers(
         self, names: List[str], refresh: bool = False
@@ -401,8 +463,33 @@ class MetaServer:
         for session in expired:
             session.close()
 
-    def _unknown_server(self, name: str) -> str:
-        return f"Unknown server '{name}'. Available: {', '.join(sorted(self.specs))}"
+    def _unknown_server(self, name: Union[str, List[str]]) -> str:
+        # Two very different causes produce this one sentence: a typo, or a name
+        # that just left the config (Magpie rewrites library.json on refresh).
+        # Without the second hint the caller retries the same spelling, which is
+        # exactly what happened on 2026-11-13 (three retries, ~1 minute wasted).
+        wanted = [name] if isinstance(name, str) else list(name)
+        names = sorted(self.specs)
+        listed = ", ".join(f"'{item}'" for item in wanted)
+        hint = (
+            f"Unknown server(s): {listed}. Available: {', '.join(names)}. "
+            "If a server was listed a moment ago, the config changed under it: "
+            "run mcp_tools with no arguments to re-list."
+        )
+        close = self._closest(wanted, names)
+        if close:
+            hint += f" Did you mean '{close}'?"
+        return hint
+
+    def _closest(self, wanted: List[str], names: List[str]) -> Optional[str]:
+        """The nearest configured name, when one of the wanted is a near miss."""
+        import difflib
+
+        for item in wanted:
+            matches = difflib.get_close_matches(item, names, n=1, cutoff=0.75)
+            if matches:
+                return matches[0]
+        return None
 
     # -- MCP protocol ----------------------------------------------------
     def tools_spec(self) -> List[Dict[str, Any]]:
@@ -548,8 +635,12 @@ class MetaServer:
             session.close()
 
 
-def serve(specs: Dict[str, ServerSpec], stream: Any = None) -> int:
-    server = MetaServer(specs)
+def serve(
+    specs: Dict[str, ServerSpec],
+    stream: Any = None,
+    reload: Optional[Callable[[], Tuple[Dict[str, ServerSpec], str]]] = None,
+) -> int:
+    server = MetaServer(specs, reload=reload)
     source = stream or sys.stdin
     try:
         for line in source:

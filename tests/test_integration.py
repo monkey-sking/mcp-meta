@@ -193,6 +193,69 @@ class HttpSessionTests(unittest.TestCase):
         finally:
             meta.close()
 
+    def test_unknown_server_names_the_alternatives_and_the_relist_route(self):
+        meta = MetaServer(self.specs)
+        try:
+            # A name that left the config while the caller held a stale list:
+            # the message must say how to get a fresh one, not just "unknown".
+            text, is_error = meta.tool_mcp_tools({"server": "webb", "refresh": True})
+            self.assertTrue(is_error)
+            self.assertIn("Unknown server(s): 'webb'", text)
+            self.assertIn("Available: web", text)
+            self.assertIn("run mcp_tools with no arguments to re-list", text)
+            self.assertIn("Did you mean 'web'?", text)
+
+            # A name with no near miss still gets the re-list hint, no bogus guess.
+            text, is_error = meta.tool_mcp_tools({"server": "zzzzzzzz"})
+            self.assertTrue(is_error)
+            self.assertIn("run mcp_tools with no arguments to re-list", text)
+            self.assertNotIn("Did you mean", text)
+
+            # The multi-server path shares the same wording.
+            text, is_error = meta.tool_mcp_tools({"servers": ["web", "nope"]})
+            self.assertTrue(is_error)
+            self.assertIn("Unknown server(s): 'nope'", text)
+            self.assertIn("run mcp_tools with no arguments to re-list", text)
+        finally:
+            meta.close()
+
+    def test_a_rewritten_config_is_picked_up_without_a_restart(self):
+        holder = {"servers": {"web": {"url": f"http://127.0.0.1:{self.server.server_address[1]}/mcp"}}}
+        reads = {"n": 0}
+
+        def reload():
+            reads["n"] += 1
+            return parse_config(holder), "test-config"
+
+        meta = MetaServer(parse_config(holder), reload=reload)
+        try:
+            # A server that appears in the file after startup is reachable once
+            # the caller asks for it: the miss triggers a re-read, not a dead end.
+            holder["servers"]["web2"] = holder["servers"]["web"]
+            listing, is_error = meta.tool_mcp_tools({"server": "web2"})
+            self.assertFalse(is_error)
+            self.assertIn("re-read test-config", listing)
+            self.assertIn("search(query: string", listing)
+            self.assertEqual(reads["n"], 1)
+
+            # A name that is still absent reports both the miss and the re-read.
+            text, is_error = meta.tool_mcp_tools({"server": "nowhere"})
+            self.assertTrue(is_error)
+            self.assertIn("Unknown server(s): 'nowhere'", text)
+            self.assertIn("re-read test-config", text)
+
+            # Removing a server drops its cached session and tool list.
+            del holder["servers"]["web2"]
+            text, is_error = meta.tool_mcp_tools({})
+            self.assertFalse(is_error)
+            self.assertIn("removed: web2", text)
+            self.assertNotIn("web2 [http]", text)
+            # And it is genuinely unknown again, not a stale hit.
+            text, is_error = meta.tool_mcp_tools({"server": "web2"})
+            self.assertTrue(is_error)
+        finally:
+            meta.close()
+
     def test_full_tool_definition(self):
         meta = MetaServer(self.specs)
         try:
